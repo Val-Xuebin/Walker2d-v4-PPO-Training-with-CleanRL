@@ -9,14 +9,23 @@ PPO training for Walker2d-v4 using CleanRL framework.
 Run the appropriate setup script for your platform:
 
 **macOS:**
+
 ```bash
 ./setup_mac.sh
 ```
 
 **Linux:**
+
 ```bash
 ./setup_linux.sh
 ```
+
+
+
+Key Versions
+
+- Gym: 1.1.1
+- Wandb: 0.24.0
 
 ### Manual Setup
 
@@ -30,9 +39,9 @@ pip install -U "wandb>=0.22.3"
 ```
 
 **Rendering backend for video generation**:
+
 - **macOS**: `brew install glfw` and `export DYLD_LIBRARY_PATH=/opt/homebrew/lib:$DYLD_LIBRARY_PATH`
 - **Linux (headless)**: `export MUJOCO_GL=osmesa` or `export MUJOCO_GL=egl`
-
 
 ## Configuration
 
@@ -79,14 +88,15 @@ python eval.py --hf-repo sdpkjc/Walker2d-v4-ppo_fix_continuous_action-seed4 --ep
 Key implementation details:
 
 1. **Gymnasium API compatibility**
+
    - `TransformObservation` wrapper requires 3 args: `(env, func, observation_space)`
    - Fixed in `make_env` and `make_eval_env` functions
-
 2. **Vectorized environment episode statistics**
+
    - Updated logging logic to support both vectorized (`episode` key) and non-vectorized (`final_info` key) environments
    - Ensures correct `episodic_return` extraction in all cases
-
 3. **Rendering backend**
+
    - Automatic backend selection for headless environments (OSMesa/EGL)
    - Manual override via `MUJOCO_GL` environment variable
 
