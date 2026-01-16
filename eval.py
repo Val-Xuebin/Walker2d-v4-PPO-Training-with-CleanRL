@@ -9,7 +9,29 @@ import gymnasium as gym
 from ppo_fix_continuous_action import Agent, make_eval_env
 from huggingface_hub import hf_hub_download
 
+def setup_rendering_backend(capture_video=False):
+    """Accomodate different rendering backends for Mac OS (glfw), and Linux (egl, osmesa) environments"""
+    if capture_video and os.environ.get("DISPLAY") is None:
+        # In headless environments, use OSMesa for offscreen rendering
+        if os.environ.get("MUJOCO_GL") is None:
+            # Check if OSMesa is available
+            import ctypes.util
+            osmesa_path = ctypes.util.find_library('OSMesa')
+            if osmesa_path:
+                os.environ["MUJOCO_GL"] = "osmesa"
+                return "osmesa"
+            else:
+                # Try EGL as fallback (requires GPU drivers)
+                os.environ["MUJOCO_GL"] = "egl"
+                return "egl"
+    return os.environ.get("MUJOCO_GL", "glfw")
+
 def evaluate_model(model_path, env_id="Walker2d-v4", eval_episodes=10, capture_video=False, run_name=None):
+    # Setup rendering backend before creating environments
+    rendering_backend = setup_rendering_backend(capture_video)
+    if capture_video and rendering_backend != "glfw":
+        print(f"Using {rendering_backend} for offscreen rendering (headless environment)")
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     if run_name is None:
@@ -37,7 +59,16 @@ def evaluate_model(model_path, env_id="Walker2d-v4", eval_episodes=10, capture_v
         actions, _, _, _ = agent.get_action_and_value(torch.Tensor(obs).to(device))
         next_obs, _, _, _, infos = envs.step(actions.cpu().numpy())
         
-        if "final_info" in infos:
+        # Support both vectorized (episode key) and non-vectorized (final_info key) environments
+        if "episode" in infos:
+            episode_info = infos["episode"]
+            if episode_info.get("_r", [False])[0]:  # Check if there's a valid episode
+                ret = float(episode_info["r"][0])
+                length = int(episode_info["l"][0])
+                print(f"  episode={len(episodic_returns)}, return={ret:.2f}, length={length}")
+                episodic_returns += [ret]
+                episodic_lengths += [length]
+        elif "final_info" in infos:
             for info in infos["final_info"]:
                 if "episode" not in info:
                     continue
@@ -56,7 +87,19 @@ def evaluate_model(model_path, env_id="Walker2d-v4", eval_episodes=10, capture_v
     print(f"  Mean: {mean_return:.2f} ± {std_return:.2f}, Range: [{min(episodic_returns):.2f}, {max(episodic_returns):.2f}]")
     
     if capture_video:
-        print(f"  Video saved to: videos/{run_name}/")
+        video_dir = f"videos/{run_name}"
+        if os.path.exists(video_dir) and os.listdir(video_dir):
+            video_files = [f for f in os.listdir(video_dir) if f.endswith(('.mp4', '.gif'))]
+            if video_files:
+                print(f"  ✓ Video saved to: {video_dir}/")
+                print(f"    Files: {', '.join(video_files[:3])}{'...' if len(video_files) > 3 else ''}")
+            else:
+                print(f"  ⚠ Video directory exists but no video files found in {video_dir}/")
+        else:
+            print(f"  ⚠ Video directory {video_dir} does not exist.")
+            print(f"  Rendering backend used: {rendering_backend}")
+            if rendering_backend == "osmesa":
+                print(f"  Note: OSMesa rendering may be slower but should work in headless environments.")
     
     return episodic_returns, episodic_lengths
 

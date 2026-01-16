@@ -154,6 +154,16 @@ def evaluate(
     device: torch.device = torch.device("cpu"),
     capture_video: bool = True,
 ):
+    # Setup rendering backend for headless environments when capturing video
+    if capture_video and os.environ.get("DISPLAY") is None:
+        if os.environ.get("MUJOCO_GL") is None:
+            import ctypes.util
+            osmesa_path = ctypes.util.find_library('OSMesa')
+            if osmesa_path:
+                os.environ["MUJOCO_GL"] = "osmesa"
+            else:
+                os.environ["MUJOCO_GL"] = "egl"
+    
     envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, capture_video, run_name)])
     agent = Model(envs).to(device)
     agent.load_state_dict(torch.load(model_path, map_location=device))
@@ -165,7 +175,16 @@ def evaluate(
     while len(episodic_returns) < eval_episodes:
         actions, _, _, _ = agent.get_action_and_value(torch.Tensor(obs).to(device))
         next_obs, _, _, _, infos = envs.step(actions.cpu().numpy())
-        if "final_info" in infos:
+        # Support both vectorized (episode key) and non-vectorized (final_info key) environments
+        if "episode" in infos:
+            episode_info = infos["episode"]
+            if episode_info.get("_r", [False])[0]:  # Check if there's a valid episode
+                episodic_return = episode_info["r"][0]
+                episodic_length = episode_info["l"][0]
+                print(f"eval_episode={len(episodic_returns)}, episodic_return={episodic_return}")
+                episodic_returns += [episodic_return]
+                episodic_lengths += [episodic_length]
+        elif "final_info" in infos:
             for info in infos["final_info"]:
                 if "episode" not in info:
                     continue
@@ -190,7 +209,7 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
                 env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         env = gym.wrappers.ClipAction(env)
         env = NormalizeObservation(env)
-        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10), env.observation_space)
         env = NormalizeReward(env, gamma=gamma)
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         return env
@@ -214,7 +233,7 @@ def make_eval_env(env_id, idx, capture_video, run_name, obs_rms=None):
         if obs_rms is not None:
             env.obs_rms = copy.deepcopy(obs_rms)
         env.freeze = True
-        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10), env.observation_space)
         return env
 
     return thunk
@@ -294,7 +313,7 @@ if __name__ == "__main__":
             sync_tensorboard=True,
             config={k: v for k, v in vars(config).items() if not k.startswith('_')},
             name=run_name,
-            monitor_gym=True,
+            monitor_gym=False,  # Disabled due to incompatibility with gymnasium >= 1.0
             save_code=True,
         )
     writer = SummaryWriter(f"runs/{run_name}")
@@ -310,7 +329,17 @@ if __name__ == "__main__":
     torch.manual_seed(config.seed)
     torch.backends.cudnn.deterministic = config.torch_deterministic
 
-    device = torch.device("cuda" if torch.cuda.is_available() and config.cuda else "cpu")
+    # Computed values
+    device = config.device
+    batch_size = int(config.num_envs * config.num_steps)
+    minibatch_size = int(batch_size // config.num_minibatches)
+    # Calculate checkpoint steps based on config
+    # Generate checkpoints every checkpoint_step until total_timesteps
+    checkpoint_steps = []
+    step = config.checkpoint_step
+    while step <= config.total_timesteps:
+        checkpoint_steps.append(step)
+        step += config.checkpoint_step
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
@@ -335,8 +364,7 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=config.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(config.num_envs).to(device)
-    num_updates = config.total_timesteps // config.batch_size
-    checkpoint_steps = [i * config.checkpoint_interval for i in range(1, config.num_checkpoints + 1)]
+    num_updates = config.total_timesteps // batch_size
 
     for update in range(1, num_updates + 1):
         # Annealing the rate if instructed to do so.
@@ -371,7 +399,7 @@ if __name__ == "__main__":
                         terminal_value = agent.get_value(torch.Tensor(real_next_obs).to(device)).reshape(1, -1)[0][0]
                     rewards[step][idx] += config.gamma * terminal_value
 
-            # Save checkpoint at specified intervals (10 checkpoints total)
+            # Save checkpoint at specified intervals
             if global_step in checkpoint_steps:
                 obs_rms, return_rms = get_rms(envs.envs[0])
                 agent.obs_rms = copy.deepcopy(get_rms(envs.envs[0])[0])
@@ -395,16 +423,25 @@ if __name__ == "__main__":
                 writer.add_scalar("charts/eval/episodic_length", np.mean(episodic_lengths), global_step)
 
             # Only print when at least 1 env is done
-            if "final_info" not in infos:
-                continue
-
-            for info in infos["final_info"]:
-                # Skip the envs that are not done
-                if info is None:
-                    continue
-                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+            # Support both vectorized (episode key) and non-vectorized (final_info key) environments
+            if "episode" in infos:
+                # Vectorized environment: episode info is directly in infos
+                episode_info = infos["episode"]
+                if episode_info.get("_r", [False])[0]:  # Check if there's a valid episode
+                    episodic_return = episode_info["r"][0]
+                    episodic_length = episode_info["l"][0]
+                    print(f"global_step={global_step}, episodic_return={episodic_return}")
+                    writer.add_scalar("charts/episodic_return", episodic_return, global_step)
+                    writer.add_scalar("charts/episodic_length", episodic_length, global_step)
+            elif "final_info" in infos:
+                # Non-vectorized environment: episode info is in final_info
+                for info in infos["final_info"]:
+                    # Skip the envs that are not done
+                    if info is None:
+                        continue
+                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                    writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+                    writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -431,12 +468,12 @@ if __name__ == "__main__":
         b_values = values.reshape(-1)
 
         # Optimizing the policy and value network
-        b_inds = np.arange(config.batch_size)
+        b_inds = np.arange(batch_size)
         clipfracs = []
         for epoch in range(config.update_epochs):
             np.random.shuffle(b_inds)
-            for start in range(0, config.batch_size, config.minibatch_size):
-                end = start + config.minibatch_size
+            for start in range(0, batch_size, minibatch_size):
+                end = start + minibatch_size
                 mb_inds = b_inds[start:end]
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])

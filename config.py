@@ -1,4 +1,5 @@
 """Training configuration for PPO Walker2d-v4"""
+import torch
 
 class Config:
     # Experiment settings
@@ -17,6 +18,7 @@ class Config:
     save_model = True
     upload_model = False
     hf_entity = "sdpkjc"
+    checkpoint_step = 100000  # Save checkpoint every N steps
     
     # Environment
     env_id = "Walker2d-v4"
@@ -39,22 +41,9 @@ class Config:
     max_grad_norm = 0.5
     target_kl = None
     
-    # Computed values
+    # Device
     @property
-    def batch_size(self):
-        return int(self.num_envs * self.num_steps)
-    
-    @property
-    def minibatch_size(self):
-        return int(self.batch_size // self.num_minibatches)
-    
-    @property
-    def num_checkpoints(self):
-        """Number of model checkpoints to save during training"""
-        return 10
-    
-    @property
-    def checkpoint_interval(self):
-        """Steps between checkpoints"""
-        return self.total_timesteps // self.num_checkpoints
+    def device(self):
+        """Get device (cuda if available and cuda=True, else cpu)"""
+        return torch.device("cuda" if torch.cuda.is_available() and self.cuda else "cpu")
 
