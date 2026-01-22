@@ -25,6 +25,9 @@ class Config:
     total_timesteps = 1000000
     num_envs = 1
     
+    # Agent network architecture
+    agent_network = "mlp"  # "mlp", "lstm", or "attn"
+    
     # Algorithm hyperparameters
     learning_rate = 3e-4
     num_steps = 2048

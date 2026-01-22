@@ -26,7 +26,27 @@ def setup_rendering_backend(capture_video=False):
                 return "egl"
     return os.environ.get("MUJOCO_GL", "glfw")
 
+def _infer_agent_config(state_dict):
+    """Infer agent configuration from state_dict without explicit type names"""
+    keys = list(state_dict.keys())
+    
+    # Check what components exist in the model
+    has_lstm = any("lstm" in k for k in keys)
+    has_attn = any("attn" in k or "input_proj" in k for k in keys)
+    is_legacy = any(k.startswith("actor_mean.0.") for k in keys)
+    
+    # Determine network type for Agent initialization
+    if has_lstm:
+        network_type = "lstm"
+    elif has_attn:
+        network_type = "attn"
+    else:
+        network_type = "mlp"
+    
+    return network_type, has_lstm, is_legacy
+
 def evaluate_model(model_path, env_id="Walker2d-v4", eval_episodes=10, capture_video=False, run_name=None):
+    """Universal evaluation function that works with any agent type"""
     # Setup rendering backend before creating environments
     rendering_backend = setup_rendering_backend(capture_video)
     if capture_video and rendering_backend != "glfw":
@@ -37,10 +57,19 @@ def evaluate_model(model_path, env_id="Walker2d-v4", eval_episodes=10, capture_v
     if run_name is None:
         run_name = f"eval_{os.path.basename(model_path).replace('.cleanrl_model', '')}"
     
+    # Load state_dict and infer configuration
+    state_dict = torch.load(model_path, map_location=device)
+    network_type, needs_hidden, is_legacy = _infer_agent_config(state_dict)
+    
     # Create temp env to get obs_rms structure
     temp_envs = gym.vector.SyncVectorEnv([make_eval_env(env_id, 0, False, "temp", None)])
-    agent = Agent(temp_envs).to(device)
-    agent.load_state_dict(torch.load(model_path, map_location=device))
+    
+    # Create and load agent
+    agent = Agent(temp_envs, network_type=network_type).to(device)
+    if is_legacy:
+        agent.load_state_dict(state_dict, strict=False)
+    else:
+        agent.load_state_dict(state_dict)
     agent.eval()
     
     # Get obs_rms from loaded agent
@@ -52,12 +81,35 @@ def evaluate_model(model_path, env_id="Walker2d-v4", eval_episodes=10, capture_v
     obs, _ = envs.reset()
     episodic_returns, episodic_lengths = [], []
     
+    # Initialize hidden state if needed
+    hidden = None
+    if needs_hidden and agent.hidden_size is not None:
+        hidden = (
+            torch.zeros(1, 1, agent.hidden_size).to(device),
+            torch.zeros(1, 1, agent.hidden_size).to(device)
+        )
+    
     print(f"\nEvaluating: {model_path}")
     print(f"Episodes: {eval_episodes}, Video: {capture_video}")
     
     while len(episodic_returns) < eval_episodes:
-        actions, _, _, _ = agent.get_action_and_value(torch.Tensor(obs).to(device))
-        next_obs, _, _, _, infos = envs.step(actions.cpu().numpy())
+        # Get action
+        actions, _, _, _, new_hidden = agent.get_action_and_value(
+            torch.Tensor(obs).to(device), 
+            hidden=hidden
+        )
+        next_obs, _, terminations, truncations, infos = envs.step(actions.cpu().numpy())
+        
+        # Update hidden state if needed
+        if needs_hidden and hidden is not None:
+            hidden = new_hidden
+            # Reset hidden state when episode ends
+            done = terminations[0] or truncations[0]
+            if done:
+                hidden = (
+                    torch.zeros(1, 1, agent.hidden_size).to(device),
+                    torch.zeros(1, 1, agent.hidden_size).to(device)
+                )
         
         # Support both vectorized (episode key) and non-vectorized (final_info key) environments
         if "episode" in infos:
@@ -210,4 +262,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -153,6 +153,7 @@ def evaluate(
     Model: torch.nn.Module,
     device: torch.device = torch.device("cpu"),
     capture_video: bool = True,
+    network_type: str = "mlp",
 ):
     # Setup rendering backend for headless environments when capturing video
     if capture_video and os.environ.get("DISPLAY") is None:
@@ -165,7 +166,7 @@ def evaluate(
                 os.environ["MUJOCO_GL"] = "egl"
     
     envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, capture_video, run_name)])
-    agent = Model(envs).to(device)
+    agent = Model(envs, network_type=network_type).to(device)
     agent.load_state_dict(torch.load(model_path, map_location=device))
     agent.eval()
     envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, capture_video, run_name, agent.obs_rms)])
@@ -173,28 +174,27 @@ def evaluate(
     obs, _ = envs.reset()
     episodic_returns, episodic_lengths = [], []
     while len(episodic_returns) < eval_episodes:
-        actions, _, _, _ = agent.get_action_and_value(torch.Tensor(obs).to(device))
-        next_obs, _, _, _, infos = envs.step(actions.cpu().numpy())
+        actions, _, _, _, _ = agent.get_action_and_value(torch.Tensor(obs).to(device), hidden=None)
+        next_obs, _, terminations, truncations, infos = envs.step(actions.cpu().numpy())
         # Support both vectorized (episode key) and non-vectorized (final_info key) environments
         if "episode" in infos:
             episode_info = infos["episode"]
             if episode_info.get("_r", [False])[0]:  # Check if there's a valid episode
                 episodic_return = episode_info["r"][0]
                 episodic_length = episode_info["l"][0]
-                print(f"eval_episode={len(episodic_returns)}, episodic_return={episodic_return}")
+                print(f"eval_episode={len(episodic_returns)}, episodic_return={episodic_return}, length={episodic_length}")
                 episodic_returns += [episodic_return]
                 episodic_lengths += [episodic_length]
         elif "final_info" in infos:
             for info in infos["final_info"]:
-                if "episode" not in info:
+                if info is None or "episode" not in info:
                     continue
-                print(f"eval_episode={len(episodic_returns)}, episodic_return={info['episode']['r']}")
+                print(f"eval_episode={len(episodic_returns)}, episodic_return={info['episode']['r']}, length={info['episode']['l']}")
                 episodic_returns += [info["episode"]["r"]]
                 episodic_lengths += [info["episode"]["l"]]
         obs = next_obs
 
     return episodic_returns, episodic_lengths
-
 
 def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
@@ -269,41 +269,133 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, envs, network_type="mlp"):
         super().__init__()
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
-        )
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01),
-        )
-        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
+        self.network_type = network_type
+        obs_dim = np.array(envs.single_observation_space.shape).prod()
+        action_dim = np.prod(envs.single_action_space.shape)
+        
+        if network_type == "mlp":
+            self.actor_backbone = nn.Sequential(
+                layer_init(nn.Linear(obs_dim, 256)),
+                nn.Tanh(),
+                layer_init(nn.Linear(256, 128)),
+                nn.Tanh(),
+            )
+            self.critic_backbone = nn.Sequential(
+                layer_init(nn.Linear(obs_dim, 256)),
+                nn.Tanh(),
+                layer_init(nn.Linear(256, 128)),
+                nn.Tanh(),
+            )
+            self.actor_mean = layer_init(nn.Linear(128, action_dim), std=0.01)
+            self.critic = layer_init(nn.Linear(128, 1), std=1.0)
+            self.hidden_size = None
+            
+        elif network_type == "lstm":
+            lstm_hidden_size = 128
+            self.lstm = nn.LSTM(obs_dim, lstm_hidden_size, batch_first=True)
+            self.actor_backbone = nn.Sequential(
+                layer_init(nn.Linear(lstm_hidden_size, 256)),
+                nn.Tanh(),
+                layer_init(nn.Linear(256, 128)),
+                nn.Tanh(),
+            )
+            self.critic_backbone = nn.Sequential(
+                layer_init(nn.Linear(lstm_hidden_size, 256)),
+                nn.Tanh(),
+                layer_init(nn.Linear(256, 128)),
+                nn.Tanh(),
+            )
+            self.actor_mean = layer_init(nn.Linear(128, action_dim), std=0.01)
+            self.critic = layer_init(nn.Linear(128, 1), std=1.0)
+            self.hidden_size = lstm_hidden_size
+        elif network_type == "attn":
+            # Attention encoder over observation to model joint coupling
+            self.num_tokens = 4
+            self.d_model = 64
+            # Project flat observation into a small sequence of tokens
+            self.input_proj = layer_init(
+                nn.Linear(obs_dim, self.num_tokens * self.d_model)
+            )
+            self.attn = nn.MultiheadAttention(
+                embed_dim=self.d_model, num_heads=4, batch_first=True
+            )
+            self.actor_backbone = nn.Sequential(
+                layer_init(nn.Linear(self.d_model, 64)),
+                nn.Tanh(),
+                layer_init(nn.Linear(64, 64)),
+                nn.Tanh(),
+            )
+            self.critic_backbone = nn.Sequential(
+                layer_init(nn.Linear(self.d_model, 64)),
+                nn.Tanh(),
+                layer_init(nn.Linear(64, 64)),
+                nn.Tanh(),
+            )
+            self.actor_mean = layer_init(nn.Linear(64, action_dim), std=0.01)
+            self.critic = layer_init(nn.Linear(64, 1), std=1.0)
+            self.hidden_size = None
+        else:
+            raise ValueError(f"Unknown network type: {network_type}")
+        
+        self.actor_logstd = nn.Parameter(torch.zeros(1, action_dim))
         self.obs_rms = RunningMeanStd(shape=envs.single_observation_space.shape)
 
-    def get_value(self, x):
-        return self.critic(x)
+    def _encode_attn(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode observation with self-attention (no temporal dimension)."""
+        # x: [B, obs_dim] -> tokens: [B, num_tokens, d_model]
+        bsz = x.shape[0]
+        proj = self.input_proj(x)
+        tokens = proj.view(bsz, self.num_tokens, self.d_model)
+        attn_out, _ = self.attn(tokens, tokens, tokens)
+        # Mean-pool over tokens
+        return attn_out.mean(dim=1)
 
-    def get_action_and_value(self, x, action=None):
-        action_mean = self.actor_mean(x)
+    def get_value(self, x, hidden=None):
+        if self.network_type == "mlp":
+            return self.critic(self.critic_backbone(x))
+        elif self.network_type == "attn":
+            features = self._encode_attn(x)
+            return self.critic(self.critic_backbone(features))
+        else:  # lstm
+            x = x.unsqueeze(1) if x.dim() == 2 else x
+            lstm_out, hidden = self.lstm(x, hidden)
+            return self.critic(lstm_out.squeeze(1)), hidden
+
+    def get_action_and_value(self, x, action=None, hidden=None):
+        if self.network_type == "mlp":
+            actor_features = self.actor_backbone(x)
+            critic_features = self.critic_backbone(x)
+            action_mean = self.actor_mean(actor_features)
+            value = self.critic(critic_features)
+            new_hidden = None
+        elif self.network_type == "attn":
+            features = self._encode_attn(x)
+            actor_features = self.actor_backbone(features)
+            critic_features = self.critic_backbone(features)
+            action_mean = self.actor_mean(actor_features)
+            value = self.critic(critic_features)
+            new_hidden = None
+        else:  # lstm
+            x = x.unsqueeze(1) if x.dim() == 2 else x
+            lstm_out, new_hidden = self.lstm(x, hidden)
+            features = lstm_out.squeeze(1)
+            action_mean = self.actor_mean(features)
+            value = self.critic(features)
+        
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
+        
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), value, new_hidden
 
 
 if __name__ == "__main__":
     config = Config()
-    run_name = f"{config.env_id}__{config.exp_name}__{config.seed}__{int(time.time())}"
+    run_name = f"ppo_{config.seed}_{int(time.time())}"
     if config.track:
         import wandb
 
@@ -347,7 +439,7 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
-    agent = Agent(envs).to(device)
+    agent = Agent(envs, network_type=config.agent_network).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=config.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
@@ -365,6 +457,13 @@ if __name__ == "__main__":
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(config.num_envs).to(device)
     num_updates = config.total_timesteps // batch_size
+    
+    # LSTM hidden state initialization
+    if config.agent_network == "lstm":
+        hidden = (torch.zeros(1, config.num_envs, agent.hidden_size).to(device),
+                  torch.zeros(1, config.num_envs, agent.hidden_size).to(device))
+    else:
+        hidden = None
 
     for update in range(1, num_updates + 1):
         # Annealing the rate if instructed to do so.
@@ -380,7 +479,7 @@ if __name__ == "__main__":
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                action, logprob, _, value, hidden = agent.get_action_and_value(next_obs, hidden=hidden)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
@@ -390,13 +489,28 @@ if __name__ == "__main__":
             done = np.logical_or(terminations, truncations)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
+            
+            # Reset LSTM hidden state when episode ends
+            if config.agent_network == "lstm":
+                done_mask = next_done.view(1, -1, 1)
+                hidden = tuple(h * (1 - done_mask) for h in hidden)
 
             # https://github.com/DLR-RM/stable-baselines3/pull/658
             for idx, trunc in enumerate(truncations):
-                if trunc and not terminations[idx]:
+                # Only use TimeLimit bootstrap if "final_observation" is actually provided
+                if trunc and not terminations[idx] and "final_observation" in infos:
                     real_next_obs = infos["final_observation"][idx]
                     with torch.no_grad():
-                        terminal_value = agent.get_value(torch.Tensor(real_next_obs).to(device)).reshape(1, -1)[0][0]
+                        if config.agent_network == "lstm":
+                            terminal_value, _ = agent.get_value(
+                                torch.Tensor(real_next_obs).to(device).unsqueeze(0),
+                                hidden=None,
+                            )
+                            terminal_value = terminal_value.reshape(1, -1)[0][0]
+                        else:
+                            terminal_value = agent.get_value(
+                                torch.Tensor(real_next_obs).to(device)
+                            ).reshape(1, -1)[0][0]
                     rewards[step][idx] += config.gamma * terminal_value
 
             # Save checkpoint at specified intervals
@@ -416,6 +530,7 @@ if __name__ == "__main__":
                     Model=Agent,
                     device=device,
                     capture_video=False,
+                    network_type=config.agent_network,
                 )
 
                 print(episodic_returns, episodic_lengths)
@@ -445,7 +560,11 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            if config.agent_network == "lstm":
+                next_value, _ = agent.get_value(next_obs, hidden=hidden)
+                next_value = next_value.reshape(1, -1)
+            else:
+                next_value = agent.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
             for t in reversed(range(config.num_steps)):
@@ -476,7 +595,7 @@ if __name__ == "__main__":
                 end = start + minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                _, newlogprob, entropy, newvalue, _ = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds], hidden=None)
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -552,6 +671,7 @@ if __name__ == "__main__":
             run_name=f"{run_name}-eval",
             Model=Agent,
             device=device,
+            network_type=config.agent_network,
         )
         for idx, episodic_return in enumerate(episodic_returns):
             writer.add_scalar("eval/episodic_return", episodic_return, idx)
