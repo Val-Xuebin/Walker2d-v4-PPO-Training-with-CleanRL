@@ -100,9 +100,10 @@ Key implementation details:
    - Automatic backend selection for headless environments (OSMesa/EGL)
    - Manual override via `MUJOCO_GL` environment variable
 
-## Files
+## Project layout
 
-- `ppo_fix_continuous_action.py`: training script
-- `config.py`: configuration
-- `eval.py`: unified evaluation script (supports multiple models, metrics, video)
+- `ppo_fix_continuous_action.py` — training script
+- `config.py` — configuration
+- `eval.py` — evaluation (multiple models, metrics, video)
+- `docs/` — extra docs (attention implementation, experiment steps, WandB metrics, training flow diagram)
 - Models: `runs/{run_name}/ppo_fix_continuous_action-{step}.cleanrl_model` (~49KB each)

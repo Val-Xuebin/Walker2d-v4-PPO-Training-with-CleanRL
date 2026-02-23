@@ -3,6 +3,7 @@ runs/*
 wandb/*
 setup_complete.sh
 readme.md
+docs/*
 
 # Python cache
 __pycache__/
